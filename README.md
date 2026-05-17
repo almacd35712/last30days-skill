@@ -260,6 +260,24 @@ These platforms don't have relationships with each other. X doesn't know what Re
 | Perplexity Sonar | OpenRouter key | Pay as you go |
 | Web search | Brave Search key | 2,000 free queries/month |
 
+### macOS Keychain (optional)
+
+On macOS you can store keys in the system Keychain instead of a `.env` file. The skill picks them up automatically as the lowest-priority source — `.env` files and process environment still win on collision.
+
+```bash
+# Interactive setup — prompts for each known key, skip with empty input
+skills/last30days/scripts/setup-keychain.sh
+
+# Or store a single key by hand
+security add-generic-password -a "$USER" -s last30days-XAI_API_KEY -w "xai-..."
+
+# Inspect / clean up
+skills/last30days/scripts/setup-keychain.sh --list
+skills/last30days/scripts/setup-keychain.sh --delete XAI_API_KEY
+```
+
+Items are stored under service name `last30days-<KEY>` for the current user. On non-Darwin platforms the loader is a no-op, so there is no behaviour change for Linux/Windows users.
+
 ## How it works
 
 1. **You type a topic.** Person, company, product, technology, "X vs Y." Anything.
