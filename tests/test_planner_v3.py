@@ -1,8 +1,4 @@
-import sys
 import unittest
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "skills" / "last30days" / "scripts"))
 
 from lib import planner
 
@@ -451,7 +447,6 @@ class FallbackDefaultsTests(unittest.TestCase):
         output = buf.getvalue()
         self.assertIn("LLM planning failed", output)
         self.assertNotIn("No --plan passed", output)
-
 
 if __name__ == "__main__":
     unittest.main()

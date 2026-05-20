@@ -1,12 +1,9 @@
 """Tests for GitHub source module."""
 
 import json
-import sys
 import unittest
-from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "skills" / "last30days" / "scripts"))
 from lib import github
 
 
@@ -157,7 +154,6 @@ class TestComputeRelevance(unittest.TestCase):
         high = github._compute_relevance("react", "React", 0, 0, 0)
         low = github._compute_relevance("react", "React", 20, 0, 0)
         self.assertGreater(high, low)
-
 
 if __name__ == "__main__":
     unittest.main()
