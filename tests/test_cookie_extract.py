@@ -10,9 +10,11 @@ from unittest.mock import patch
 
 import pytest
 
+from lib import cookie_extract
 from lib.cookie_extract import (
     extract_cookies,
     extract_firefox_cookies,
+    has_complete_pair,
     _query_cookies_db,
     _find_default_profile,
     _get_firefox_profiles_dir,
@@ -40,6 +42,9 @@ def mock_firefox_env(tmp_path):
                 default_profile: [
                     (".x.com", "auth_token", "tok_abc123"),
                     (".x.com", "ct0", "ct0_xyz789"),
+                    (".x.com", "session", "sess_unrequested"),
+                    (".example.com", "auth_token", "foreign_auth_token"),
+                    (".example.com", "ct0", "foreign_ct0"),
                     (".example.com", "session", "sess_other"),
                 ],
             }
@@ -123,6 +128,38 @@ class TestExtractFirefoxCookies:
 
         assert result == {"auth_token": "tok_abc123"}
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission model does not apply on Windows; mkstemp is 0o666 there")
+    def test_temp_cookie_copy_never_world_readable(self, tmp_path):
+        """The temp copy must be private the instant it exists, not only after
+        the lock chmod. Regression for the TOCTOU window where copy2 widened the
+        0600 mkstemp file to the source's 0644 before _lock_temp_cookie_copy ran.
+        """
+        db_path = tmp_path / "cookies.sqlite"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE moz_cookies (name TEXT NOT NULL, value TEXT NOT NULL, host TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO moz_cookies (name, value, host) VALUES (?, ?, ?)",
+            ("auth_token", "tok_abc123", ".x.com"),
+        )
+        conn.commit()
+        conn.close()
+        os.chmod(db_path, 0o644)  # loose source perms, as Firefox ships them
+
+        observed = {}
+        real_lock = cookie_extract._lock_temp_cookie_copy
+
+        def spy(path):
+            # Mode of the copy as it exists right after copyfile, before chmod.
+            observed["mode_after_copy"] = os.stat(path).st_mode & 0o777
+            return real_lock(path)
+
+        with patch.object(cookie_extract, "_lock_temp_cookie_copy", side_effect=spy):
+            _query_cookies_db(db_path, ".x.com", ["auth_token"])
+
+        assert observed["mode_after_copy"] == 0o600
+
     def test_valid_cookies_extracted(self, mock_firefox_env):
         """Cookies for the target domain are returned correctly."""
         profiles_dir = mock_firefox_env()
@@ -133,10 +170,7 @@ class TestExtractFirefoxCookies:
         ):
             result = extract_firefox_cookies(".x.com", ["auth_token", "ct0"])
 
-        assert result is not None
-        assert result["auth_token"] == "tok_abc123"
-        assert result["ct0"] == "ct0_xyz789"
-        assert "session" not in result  # different domain cookie not included
+        assert result == {"auth_token": "tok_abc123", "ct0": "ct0_xyz789"}
 
     def test_multiple_profiles_selects_default(self, mock_firefox_env):
         """When multiple profiles exist, the one with Default=1 is used."""
@@ -190,6 +224,74 @@ class TestExtractFirefoxCookies:
 
         assert result is None
 
+    def test_default_partial_yields_to_complete_non_default(self, mock_firefox_env):
+        """Default profile holds a lone ct0 (logged-out); the logged-in
+        non-default profile's complete pair wins."""
+        profiles_dir = mock_firefox_env(
+            profiles={
+                "aaa111.default": [
+                    (".x.com", "ct0", "partial_ct0"),
+                ],
+                "bbb222.release": [
+                    (".x.com", "auth_token", "tok_complete"),
+                    (".x.com", "ct0", "ct0_complete"),
+                ],
+            },
+            profiles_ini=textwrap.dedent("""\
+                [General]
+                StartWithLastProfile=1
+
+                [Profile0]
+                Name=default
+                IsRelative=1
+                Path=aaa111.default
+                Default=1
+
+                [Profile1]
+                Name=release
+                IsRelative=1
+                Path=bbb222.release
+            """),
+        )
+
+        with patch(
+            "lib.cookie_extract._get_firefox_profiles_dir",
+            return_value=profiles_dir,
+        ):
+            result = extract_firefox_cookies(".x.com", ["auth_token", "ct0"])
+
+        assert result is not None
+        assert result["auth_token"] == "tok_complete"
+        assert result["ct0"] == "ct0_complete"
+
+    def test_partial_fallback_when_no_complete_profile(self, mock_firefox_env):
+        """With no complete profile anywhere, the first partial is kept."""
+        profiles_dir = mock_firefox_env(
+            profiles={
+                "aaa111.default": [
+                    (".x.com", "ct0", "partial_ct0"),
+                ],
+            },
+            profiles_ini=textwrap.dedent("""\
+                [General]
+                StartWithLastProfile=1
+
+                [Profile0]
+                Name=default
+                IsRelative=1
+                Path=aaa111.default
+                Default=1
+            """),
+        )
+
+        with patch(
+            "lib.cookie_extract._get_firefox_profiles_dir",
+            return_value=profiles_dir,
+        ):
+            result = extract_firefox_cookies(".x.com", ["auth_token", "ct0"])
+
+        assert result == {"ct0": "partial_ct0"}
+
     def test_cookies_sqlite_empty(self, mock_firefox_env):
         """Returns None when cookies.sqlite has no rows."""
         profiles_dir = mock_firefox_env(
@@ -212,6 +314,8 @@ class TestExtractFirefoxCookies:
         profiles_dir = mock_firefox_env(
             profiles={
                 "abc123.default-release": [
+                    (".example.com", "auth_token", "foreign_auth_token"),
+                    (".example.com", "ct0", "foreign_ct0"),
                     (".example.com", "session", "sess_123"),
                 ],
             },
@@ -247,6 +351,39 @@ class TestExtractFirefoxCookies:
 
         assert result is not None
         assert result["auth_token"] == "fallback_token"
+
+    def test_utf16_profiles_ini_uses_install_default(self, mock_firefox_env):
+        """Firefox on Windows writes UTF-16 LE profiles.ini (#1067)."""
+        default_profile = "en3ndvop.default-release"
+        decoy = "aaa111.decoy"
+        profiles_dir = mock_firefox_env(
+            default_profile=default_profile,
+            profiles={
+                decoy: [
+                    (".x.com", "auth_token", "decoy_token"),
+                ],
+                default_profile: [
+                    (".x.com", "auth_token", "utf16_token"),
+                    (".x.com", "ct0", "utf16_ct0"),
+                ],
+            },
+        )
+        ini = textwrap.dedent(f"""\
+            [Install308046B0AF4A39CB]
+            Default={default_profile}
+            Locked=1
+        """)
+        (profiles_dir / "profiles.ini").write_bytes(ini.encode("utf-16"))
+
+        with patch(
+            "lib.cookie_extract._get_firefox_profiles_dir",
+            return_value=profiles_dir,
+        ):
+            result = extract_firefox_cookies(".x.com", ["auth_token", "ct0"])
+
+        assert result is not None
+        assert result["auth_token"] == "utf16_token"
+        assert result["ct0"] == "utf16_ct0"
 
     def test_non_default_profile_with_cookies(self, mock_firefox_env):
         """Falls back to non-default profile when default has no X cookies."""
@@ -410,3 +547,34 @@ class TestExtractCookiesAuto:
         ):
             result = extract_cookies("safari", ".x.com", ["auth_token"])
         assert result == {"auth_token": "safari_tok"}
+
+
+class TestHasCompletePair:
+    """Tests for the shared has_complete_pair() helper."""
+
+    def test_none_is_incomplete(self):
+        assert has_complete_pair(None, ["auth_token", "ct0"]) is False
+
+    def test_empty_is_incomplete(self):
+        assert has_complete_pair({}, ["auth_token", "ct0"]) is False
+
+    def test_partial_pair_is_incomplete(self):
+        assert has_complete_pair({"ct0": "x"}, ["auth_token", "ct0"]) is False
+
+    def test_empty_valued_pair_is_incomplete(self):
+        assert has_complete_pair({"auth_token": "", "ct0": ""}, ["auth_token", "ct0"]) is False
+        assert has_complete_pair({"auth_token": "a", "ct0": ""}, ["auth_token", "ct0"]) is False
+
+    def test_complete_pair(self):
+        assert has_complete_pair(
+            {"auth_token": "a", "ct0": "c"}, ["auth_token", "ct0"]
+        ) is True
+
+    def test_single_cookie_service(self):
+        assert has_complete_pair({"_session_id": "s"}, ["_session_id"]) is True
+
+    def test_extra_keys_still_complete(self):
+        assert has_complete_pair(
+            {"auth_token": "a", "ct0": "c", "other": "o"},
+            ["auth_token", "ct0"],
+        ) is True

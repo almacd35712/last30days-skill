@@ -1,13 +1,11 @@
-// Package tools owns the MCP tool surface for last30days. Today there is
-// exactly one tool, research, mirroring the /last30days <topic> slash
-// command available in Claude Code. Adding new tools means another file
-// here plus an additional s.AddTool call in Register.
+// Package tools owns the MCP tool surface for last30days.
 package tools
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
@@ -22,9 +20,21 @@ type Config struct {
 	Version string
 }
 
+// BrowserCookiesEnvOverride is an explicit MCP-layer opt-in. It only removes
+// the default-deny CLI flag; the engine still enforces its own recorded
+// browser-cookie consent and configuration.
+const BrowserCookiesEnvOverride = "LAST30DAYS_MCP_ALLOW_BROWSER_COOKIES"
+
+// allowEnginePlanEnv lets the engine use its internal planner. The research
+// tool has no query-plan argument, so the engine must plan for itself; without
+// this, an MCP server launched from an agent shell (which inherits markers such
+// as CLAUDECODE) would hit the engine's LAW 7 host-plan gate and exit 2.
+const allowEnginePlanEnv = "LAST30DAYS_ALLOW_ENGINE_PLAN=1"
+
 // Register adds every tool this server exposes to s. The caller supplies a
 // Config so test harnesses can pin a version without touching globals.
 func Register(s *server.MCPServer, cfg Config) {
+	registerPreflightTool(s, cfg)
 	s.AddTool(
 		mcplib.NewTool("research",
 			mcplib.WithDescription(
@@ -36,7 +46,7 @@ func Register(s *server.MCPServer, cfg Config) {
 			mcplib.WithString("topic", mcplib.Required(), mcplib.Description("The subject to research (a person, company, product, event, or general topic).")),
 			mcplib.WithString("emit", mcplib.Description("Output shape: 'compact' (default) for inline synthesis or 'html' to save a shareable brief alongside the response.")),
 			mcplib.WithBoolean("save", mcplib.Description("Persist the synthesis as a markdown report under ~/Documents/Last30Days/ (or LAST30DAYS_MEMORY_DIR if set).")),
-			mcplib.WithReadOnlyHintAnnotation(true),
+			mcplib.WithReadOnlyHintAnnotation(false),
 			mcplib.WithDestructiveHintAnnotation(false),
 			mcplib.WithOpenWorldHintAnnotation(true),
 		),
@@ -74,20 +84,56 @@ func makeResearchHandler(cfg Config) server.ToolHandlerFunc {
 			)), nil
 		}
 
-		runArgs := []string{topic, "--emit=" + emit}
-		if save {
-			runArgs = append(runArgs, "--save")
-		}
+		runArgs := researchRunArgs(topic, emit, save)
 
 		res, runErr := engine.Run(ctx, engine.RunOptions{
 			CacheDir: cacheDir,
 			Args:     runArgs,
+			ExtraEnv: researchExtraEnv(),
 		})
 		if runErr != nil {
 			return mcplib.NewToolResultError(formatRunError(runErr, res)), nil
 		}
 		return mcplib.NewToolResultText(string(res.Stdout)), nil
 	}
+}
+
+func researchRunArgs(topic, emit string, save bool) []string {
+	// Options first, positional topic last behind a `--` separator: a
+	// dash-prefixed topic must never be parsed as engine flags.
+	runArgs := []string{"--emit=" + emit}
+	if !browserCookiesAllowed() {
+		runArgs = append(runArgs, "--no-browser-cookies")
+	}
+	// Always pass --save-dir explicitly. An empty value skips the engine's
+	// `is None` LAST30DAYS_MEMORY_DIR fallback and is falsy at the save
+	// gate, so declining to save writes nothing even when the env var set.
+	if save {
+		runArgs = append(runArgs, "--save-dir", mcpSaveDir())
+	} else {
+		runArgs = append(runArgs, "--save-dir", "")
+	}
+	return append(runArgs, "--", topic)
+}
+
+func researchExtraEnv() []string {
+	return []string{allowEnginePlanEnv}
+}
+
+func browserCookiesAllowed() bool {
+	raw := os.Getenv(BrowserCookiesEnvOverride)
+	return raw == "1" ||
+		strings.EqualFold(raw, "true") ||
+		strings.EqualFold(raw, "yes") ||
+		strings.EqualFold(raw, "on")
+}
+
+func mcpSaveDir() string {
+	saveDir := os.Getenv("LAST30DAYS_MEMORY_DIR")
+	if saveDir == "" {
+		return "~/Documents/Last30Days"
+	}
+	return saveDir
 }
 
 func requireString(args map[string]any, name string) (string, error) {
