@@ -161,6 +161,7 @@ SOURCE_ORDER = (
     "hackernews",
     "polymarket",
     "github",
+    "devto",
     "digg",
     "techmeme",
     "arxiv",
@@ -490,8 +491,8 @@ def _x_record(config):
     # Policy-gated: on an official-only host no run-time cookie source
     # exists unless bird is pinned, and then the note names only the pin.
     #
-    # This check MUST come before grok normalization: a pending bird path takes
-    # precedence over marking X as unconfigured due to an unused grok store.
+    # This check MUST come before grok normalization: a pending bird path or
+    # a recorded setup denial takes precedence over an unused grok store.
     # Handle both "unconfigured" (all backends missing) and "error" (grok present
     # but opt-in, no auto-chain backend usable) when pending bird applies.
     #
@@ -502,7 +503,24 @@ def _x_record(config):
     pending_bird = policy.cookie_discovery and env.x_pending_browser_auth(
         config, local_only=True
     )
-    if pending_bird and record["status"] in ("unconfigured", health.ERROR):
+    reported_denials = set((config.get("LAST30DAYS_X_COOKIE_ACCESS_DENIED") or "").split(","))
+    known_browsers = set(env.COOKIE_BROWSER_NAMES)
+    if (
+        policy.cookie_discovery
+        and str(config.get("BROWSER_CONSENT") or "").lower() in {"1", "true", "yes", "on"}
+        and str(config.get("FROM_BROWSER") or "").strip().lower() != "off"
+    ):
+        denied_browsers = sorted(reported_denials & known_browsers)
+    else:
+        denied_browsers = []
+    if denied_browsers and record.get("pinned") and env.x_backend_pin(config) != "bird":
+        observation = (
+            "Last setup: permission denied reading X cookies from "
+            f"{', '.join(denied_browsers)}; current access not checked"
+        )
+        record["note"] = f"{record['note']}; {observation}" if record["note"] else observation
+        return record
+    if (pending_bird or denied_browsers) and record["status"] in ("unconfigured", health.ERROR):
         backends_list = record.get("backends", [])
         auto_backends = [b for b in backends_list if b.get("name") in auto_chain_names]
         # Only apply pending-bird upgrade if ALL auto-chain backends are MISSING.
@@ -511,6 +529,15 @@ def _x_record(config):
             b.get("status") == health.MISSING for b in auto_backends
         )
         if all_auto_missing:
+            if denied_browsers:
+                record["status"] = health.ERROR
+                record["tier"] = TIER_BY_STATUS[health.ERROR]
+                record["note"] = (
+                    "Last setup: permission denied reading X cookies from "
+                    f"{', '.join(denied_browsers)}; current access not checked"
+                )
+                record["fix"] = env.X_COOKIE_ACCESS_FIX
+                return record
             record["status"] = health.OK
             record["tier"] = TIER_BY_STATUS[health.OK]
             if policy.official_only:
@@ -646,6 +673,17 @@ def _web_record(config):
 
 def _hackernews_record(config):
     return _record(status=health.OK, requires="none (free Algolia API)")
+
+
+def _devto_record(config):
+    requires = "none (public Forem API)"
+    if "devto" in env.include_sources(config):
+        return _record(status=health.OK, requires=requires)
+    return _record(
+        status="opt-in", requires=requires,
+        fix="add devto to INCLUDE_SOURCES (or request it via --search devto)",
+        note="off by default; --devto-tags activates it for a run",
+    )
 
 
 def _polymarket_record(config):
@@ -959,6 +997,7 @@ _SOURCE_BUILDERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "hackernews": _hackernews_record,
     "polymarket": _polymarket_record,
     "github": _github_record,
+    "devto": _devto_record,
     "digg": _digg_record,
     "techmeme": _techmeme_record,
     "arxiv": _arxiv_record,
@@ -1129,7 +1168,8 @@ def _sub_lanes_for(source: str, config: Dict[str, Any]):
         backups.append({"name": "ScrapeCreators backfill", "armed": has_sc, "note": note})
     elif source == "youtube":
         backups.append({
-            "name": "ScrapeCreators transcript/search backstop", "armed": has_sc,
+            "name": "ScrapeCreators transcript/search backstop",
+            "armed": env.is_youtube_sc_available(config),
             "note": "used when yt-dlp is rate-limited or bot-gated",
         })
         comments = {"enabled": bool(env.is_youtube_comments_available(config))}
@@ -1642,6 +1682,7 @@ _SECRET_CONFIG_VARS = KEY_PRESENCE_VARS + (
 _FINGERPRINT_PIN_VARS = (
     env.X_BACKEND_PIN_VAR,
     env.REDDIT_BACKEND_PIN_VAR,
+    env.YOUTUBE_BACKEND_PIN_VAR,
     env.X_HOST_VAR,
     env.X_HOST_LANE_VAR,
 )
@@ -1690,6 +1731,9 @@ def _config_fingerprint(config: Dict[str, Any]) -> str:
         "keys_present": _setup_block(config)["keys_present"],
         "pins": {var: str(config.get(var) or "") for var in _FINGERPRINT_PIN_VARS},
         "include_sources": str(config.get("INCLUDE_SOURCES") or ""),
+        "x_cookie_access_denied": str(config.get("LAST30DAYS_X_COOKIE_ACCESS_DENIED") or ""),
+        "browser_consent": str(config.get("BROWSER_CONSENT") or ""),
+        "from_browser": str(config.get("FROM_BROWSER") or ""),
     }
     canonical = json.dumps(signals, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

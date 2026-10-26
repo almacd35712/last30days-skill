@@ -209,8 +209,12 @@ def test_default_register_is_byte_identical_when_omitted(monkeypatch):
         # Hash includes #886's linked evidence URLs, #890's Hacker News
         # comment-rendering changes, the quiet footer (no outcome text, no
         # ## Source Errors in compact), and the comments pool reading every
-        # floor-clearing cluster.
-        "81fdfc85643d124f2c06ff0bac8956c30280c652436bc4a58dbfc37718be71e1"
+        # floor-clearing cluster, and the canonical boundary's inline-citation
+        # wording (no tool-contract override claim), and HN cluster-evidence
+        # comment lines carrying the comment's own link, and #706's fenced
+        # text footer, and #1082's removal of LAW N framing from model-visible
+        # contract text.
+        "7f59fe51a42de2983cc5ef863c03090f7c73d2a2e5adcea236883f14fe550ef5"
     )
 
 

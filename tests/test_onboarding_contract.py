@@ -314,8 +314,11 @@ class TestOnboardingContract(unittest.TestCase):
         # transport/rate-limit escalation, and no longer empty-only).
         self.assertIn("fewer than 5 items", before)
         self.assertIn("LAST30DAYS_REDDIT_SC_MIN_ITEMS=0", before)
+        self.assertIn("YouTube search below 3", before)
+        self.assertIn("LAST30DAYS_YT_SC_MIN_ITEMS=0", before)
+        self.assertIn("spends credits", before)
         self.assertNotIn("returns no items", before)
-        self.assertNotIn("empty-only", before)
+        self.assertNotIn("empty-path Reddit", before)
         self.assertNotIn("when they hit rate limits", before)
         # Free-path comments are shreddit; do not claim SC comment preference.
         self.assertNotIn("prefers ScrapeCreators for Reddit", before)
@@ -385,9 +388,12 @@ class TestOnboardingContract(unittest.TestCase):
                 self.assertNotIn("only a Firefox/Safari winner", flow)
                 self.assertNotIn("Chrome never re-", flow)
 
-    def test_fda_reframed_as_safari_fallback(self):
-        """Full Disk Access is framed as Safari-only, not the default path."""
+    def test_browser_permission_remediation_keeps_chromium_first(self):
+        """Browser permission guidance does not change consented scan order."""
         self.assertNotIn("scan your browser (Firefox/Safari)", self.modal)
+        self.assertIn("X cookie access was permission denied", self.modal)
+        self.assertIn("X cookie access was permission denied", self.prose)
+        self.assertIn("AUTH_TOKEN and CT0", self.modal)
 
     def test_welcome_embedded_in_modal(self):
         """The welcome pitch lives INSIDE the setup modal (the only always-visible

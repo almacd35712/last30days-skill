@@ -59,6 +59,11 @@ KEYCHAIN_ALIASES_ENV = "LAST30DAYS_KEYCHAIN_ALIASES"
 # a stored key can silently satisfy a lookup the test meant to see fail.
 KEYCHAIN_DISABLE_ENV = "LAST30DAYS_SKIP_KEYCHAIN"
 
+X_COOKIE_ACCESS_FIX = (
+    "Check the browser-data permissions for the terminal or agent host and retry setup. "
+    "If access remains blocked, set AUTH_TOKEN and CT0 manually or use XAI_API_KEY."
+)
+
 # Single source of truth for which credentials the Keychain loader looks up.
 # The setup-keychain.sh helper mirrors this list and is held in sync via
 # tests/test_env_keychain.py::test_keychain_keys_match_setup_script.
@@ -615,6 +620,7 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('LAST30DAYS_X_MODEL', None),
         ('LAST30DAYS_X_BACKEND', None),
         ('LAST30DAYS_REDDIT_BACKEND', None),
+        ('LAST30DAYS_YOUTUBE_BACKEND', None),
         # Keyless reddit.com token-bucket rate (req/sec). http.py reads it
         # from os.environ on each acquire, so .env values are exported below.
         ('LAST30DAYS_REDDIT_KEYLESS_RATE', None),
@@ -623,6 +629,7 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         # Per-source deadline (seconds) for doctor --probe live checks.
         ('LAST30DAYS_DOCTOR_PROBE_TIMEOUT', None),
         ('LAST30DAYS_REDDIT_SC_MIN_ITEMS', None),
+        ('LAST30DAYS_YT_SC_MIN_ITEMS', None),
         ('LAST30DAYS_STORE', None),
         # Discovery topic queue (podcast/X-article pipeline memory). Default
         # ON; the literal value "off" disables queue writes and annotations.
@@ -688,7 +695,7 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         # Bright Data CLI. Optional: the CLI normally owns its own auth via
         # `brightdata login`, so this only matters for users who prefer an
         # explicit key in a `.env` file or the keychain. Registered here so
-        # those layers reach the gate and the subprocess (-k) alike.
+        # those layers reach the gate and the subprocess environment alike.
         ('BRIGHTDATA_API_KEY', None),
         # Amazon marketplace the amazon source searches. Non-US users point
         # this at their own storefront (e.g. https://www.amazon.co.uk).
@@ -710,6 +717,7 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('LAST30DAYS_TRUSTPILOT_NO_BROWSER', None),
         ('FROM_BROWSER', None),
         ('BROWSER_CONSENT', None),
+        ('LAST30DAYS_X_COOKIE_ACCESS_DENIED', None),
         # agentcookie sidecar: soft-dep X cookie source (lib/agentcookie.py),
         # active only on extra hosts (Linux / Mac mini / Darwin sink) or when
         # set to "on". "off" disables the sidecar reader.
@@ -732,6 +740,10 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         # follow-up command. New writes use LAST30DAYS_REGISTER=eli5.
         ('ELI5_MODE', None),
         ('LAST30DAYS_YOUTUBE_SSH_HOST', None),
+        # Proxy for yt-dlp; YT_PROXY is the short alias. Only routes yt-dlp
+        # traffic — does not affect other HTTP calls the skill makes.
+        ('YOUTUBE_PROXY', None),
+        ('YT_PROXY', None),
         ('LAST30DAYS_REPORT_CACHE_TTL_SECONDS', None),
         ('LAST30DAYS_VERIFY_FRESHNESS', None),
         ('LAST30DAYS_TRANSCRIPT_TIMEOUT', None),
@@ -746,6 +758,7 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         # applied there when the key is absent. Empty disables.
         ('LAST30DAYS_YT_PLAYER_CLIENT', None),
         ('LAST30DAYS_YT_TRANSCRIPT_FAST_TIMEOUT', None),
+        ('LAST30DAYS_YT_TRANSCRIPT_FAST_ATTEMPTS', None),
         ('LAST30DAYS_YT_SEARCH_TIMEOUT', None),
         ('GITHUB_TOKEN', None),
         # Host self-identification. `grok-bot` switches the X policy
@@ -791,6 +804,7 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
     for key in (
         'LAST30DAYS_YT_SUB_LANGS',
         'LAST30DAYS_YT_TRANSCRIPT_FAST_TIMEOUT',
+        'LAST30DAYS_YT_TRANSCRIPT_FAST_ATTEMPTS',
         'LAST30DAYS_YT_SEARCH_TIMEOUT',
         'LAST30DAYS_REDDIT_KEYLESS_RATE',
         'LAST30DAYS_YT_PLAYER_CLIENT',
@@ -1068,6 +1082,10 @@ COOKIE_DOMAINS: dict[str, dict[str, Any]] = {
     },
 }
 
+COOKIE_BROWSER_NAMES = (
+    "firefox", "safari", "chrome", "brave", "edge", "vivaldi", "opera", "arc", "chromium"
+)
+
 
 def cookie_extraction_browsers(config: dict[str, Any]) -> list[str]:
     """Browsers to try for cookie extraction, honoring FROM_BROWSER.
@@ -1097,9 +1115,9 @@ def cookie_extraction_browsers(config: dict[str, Any]) -> list[str]:
     consent = config.get("BROWSER_CONSENT")
     if consent is not None and str(consent).strip().lower() not in {"1", "true", "yes", "on"}:
         return []
-    silent_browsers = ["firefox", "safari"]
-    chromium_browsers = ["chrome", "brave", "edge", "vivaldi", "opera", "arc", "chromium"]
-    known_browsers = silent_browsers + chromium_browsers
+    silent_browsers = list(COOKIE_BROWSER_NAMES[:2])
+    chromium_browsers = list(COOKIE_BROWSER_NAMES[2:])
+    known_browsers = list(COOKIE_BROWSER_NAMES)
     from_browser = (config.get("FROM_BROWSER") or "").strip().lower()
     if not from_browser:
         return []
@@ -1149,16 +1167,31 @@ def extract_browser_credentials(config: dict[str, Any]) -> dict[str, str]:
         return {}
     extracted: dict[str, str] = {}
     for _service, spec in COOKIE_DOMAINS.items():
-        if all(config.get(env_key) for env_key in spec["mapping"].values()):
+        missing_cookies = [
+            name for name in spec["cookies"] if not config.get(spec["mapping"][name])
+        ]
+        if not missing_cookies:
             continue
         # Cookies from different browsers can belong to different sessions,
         # so values are never combined across browsers: a complete set from
         # one browser wins, else the first browser's partial set is kept.
         chosen: dict[str, str] | None = None
         fallback: dict[str, str] | None = None
+        denied_browsers: list[str] = []
         for browser in browsers:
             try:
                 cookies = cookie_extract.extract_cookies(browser, spec["domain"], spec["cookies"])
+            except PermissionError:
+                denied_browsers.append(browser)
+                if len(missing_cookies) == len(spec["cookies"]):
+                    continue
+                # Keep full-pair profile preference unless a denied profile blocks it.
+                try:
+                    cookies = cookie_extract.extract_cookies(
+                        browser, spec["domain"], missing_cookies
+                    )
+                except Exception:
+                    continue
             except Exception:
                 continue
             if not cookies:
@@ -1170,6 +1203,13 @@ def extract_browser_credentials(config: dict[str, Any]) -> dict[str, str]:
                 fallback = cookies
         if chosen is None:
             chosen = fallback or {}
+        if _service == "x" and denied_browsers and not cookie_extract.has_complete_pair(
+            chosen, spec["cookies"]
+        ):
+            sys.stderr.write(
+                "[last30days] X browser cookie access permission denied in "
+                f"{', '.join(denied_browsers)}. {X_COOKIE_ACCESS_FIX}\n"
+            )
         for cookie_name, env_key in spec["mapping"].items():
             if chosen.get(cookie_name) and not config.get(env_key):
                 extracted[env_key] = chosen[cookie_name]
@@ -1321,11 +1361,17 @@ X_BACKEND_KNOWN = _X_BACKEND_KNOWN
 X_OFFICIAL = _X_OFFICIAL
 X_BACKEND_PIN_VAR = 'LAST30DAYS_X_BACKEND'
 REDDIT_BACKEND_PIN_VAR = 'LAST30DAYS_REDDIT_BACKEND'
+# `yt-dlp` keeps YouTube off ScrapeCreators while the key still serves other
+# sources (#1316). It is the only pin value; anything else means auto.
+YOUTUBE_BACKEND_PIN_VAR = 'LAST30DAYS_YOUTUBE_BACKEND'
+YOUTUBE_BACKEND_PIN_VALUES = ('yt-dlp',)
 REDDIT_SC_MIN_ITEMS_VAR = 'LAST30DAYS_REDDIT_SC_MIN_ITEMS'
 # Keyed runs backfill Reddit from ScrapeCreators when the free path returns
 # fewer than this many items. Thin topics yield 2-3 free results; healthy
 # topics many more, so 5 spends credits only where it adds coverage.
 REDDIT_SC_MIN_ITEMS_DEFAULT = 5
+YOUTUBE_SC_MIN_ITEMS_VAR = 'LAST30DAYS_YT_SC_MIN_ITEMS'
+YOUTUBE_SC_MIN_ITEMS_DEFAULT = 3
 
 
 def reddit_sc_min_items(config: dict[str, Any]) -> int:
@@ -1338,6 +1384,17 @@ def reddit_sc_min_items(config: dict[str, Any]) -> int:
     raw = config.get(REDDIT_SC_MIN_ITEMS_VAR)
     if raw is None or (isinstance(raw, str) and not raw.strip()):
         return REDDIT_SC_MIN_ITEMS_DEFAULT
+    try:
+        return max(int(raw), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def youtube_sc_min_items(config: dict[str, Any]) -> int:
+    """Minimum yt-dlp result count before keyed YouTube search backfill is skipped."""
+    raw = config.get(YOUTUBE_SC_MIN_ITEMS_VAR)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return YOUTUBE_SC_MIN_ITEMS_DEFAULT
     try:
         return max(int(raw), 0)
     except (TypeError, ValueError):
@@ -1580,7 +1637,7 @@ def is_youtube_comments_available(config: dict[str, Any]) -> bool:
         return False
     if is_ytdlp_available():
         return True
-    if not config.get('SCRAPECREATORS_API_KEY'):
+    if not is_youtube_sc_available(config):
         return False
     return 'youtube_comments' in _parse_include_sources(config)
 
@@ -1611,11 +1668,23 @@ def is_instagram_comments_available(config: dict[str, Any]) -> bool:
     return 'instagram_comments' in _parse_include_sources(config)
 
 
-def is_youtube_sc_available(config: dict[str, Any]) -> bool:
-    """Check if ScrapeCreators YouTube search fallback is available.
+def youtube_backend_pin(config: dict[str, Any]) -> str:
+    """The normalized ``LAST30DAYS_YOUTUBE_BACKEND`` pin ("" when unset or unknown)."""
+    raw = (config.get(YOUTUBE_BACKEND_PIN_VAR) or '').strip().lower()
+    if raw == 'ytdlp':
+        raw = 'yt-dlp'
+    return raw if raw in YOUTUBE_BACKEND_PIN_VALUES else ''
 
-    Used when yt-dlp is not installed or fails.
+
+def is_youtube_sc_available(config: dict[str, Any]) -> bool:
+    """Check if the YouTube lane may spend ScrapeCreators credits.
+
+    Gates the SC search fallback, the per-video transcript rescue, and SC
+    comments. False without a key, or when ``LAST30DAYS_YOUTUBE_BACKEND=yt-dlp``
+    keeps YouTube keyless while the key still serves other sources.
     """
+    if youtube_backend_pin(config) == 'yt-dlp':
+        return False
     return bool(config.get('SCRAPECREATORS_API_KEY'))
 
 

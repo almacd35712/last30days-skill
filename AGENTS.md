@@ -30,7 +30,7 @@ Agent Skills package for researching any topic across Reddit, X, YouTube, and we
 python3 skills/last30days/scripts/last30days.py "test query" --emit=compact
 npx skills add . -g -y   # copies skill into ~/.agents/skills/<name>/ (frozen at install time); re-run to sync working-tree edits — see Rules below
 
-# Tests (pytest, ~89 files under tests/, configured in pyproject.toml)
+# Tests (pytest; tests/ discovery is configured in pyproject.toml)
 uv run pytest                              # full suite
 uv run pytest tests/test_dedupe_v3.py      # single file
 uv run pytest tests/test_dedupe_v3.py -k some_case   # single case
@@ -55,7 +55,7 @@ Agents open most PRs. Follow this so `CHANGELOG.md` stops conflicting and versio
 
 ## Rules
 - `lib/__init__.py` must be bare package marker (comment only, NO eager imports)
-- One-time setup: `npx skills add . -g -y` copies the skill into `~/.agents/skills/<name>/` (real directory) and, for harnesses that support symlinked skill dirs, drops a per-host symlink pointing at that copy. **Working-tree edits do NOT propagate automatically** — the `~/.agents/skills/<name>/` copy is frozen at install time. To sync after edits, re-run `npx skills add . -g -y`. For live-edit on a dev machine, replace the install copy with a symlink to the working tree: `ln -sfn "$PWD/skills/last30days" ~/.agents/skills/last30days` (run from the repo root).
+- One-time setup: `npx skills add . -g -y` copies the skill into `~/.agents/skills/<name>/` (real directory) and, for harnesses that support symlinked skill dirs, drops a per-host symlink pointing at that copy. **Working-tree edits do NOT propagate automatically** — the `~/.agents/skills/<name>/` copy is frozen at install time. To sync after edits, re-run `npx skills add . -g -y`. For live-edit on a dev machine, move that real directory to a backup outside `~/.agents/skills/` first, then create the working-tree symlink: `ln -sfn "$PWD/skills/last30days" ~/.agents/skills/last30days` (run from the repo root). `ln -sfn` replaces an existing symlink but does not replace a real directory; with the install copy still present, it creates a link inside that directory and leaves the stale skill active.
 - Git remote: origin = public (`mvanhorn/last30days-skill`)
 - Do not reduce `fail_under` in `pyproject.toml` (`[tool.coverage.report]`) without documenting why in the PR. The coverage gate is a floor meant to rise over time, not to be relaxed when new code is under-tested.
 - Every `lib/*.py` call to `log.source_log(...)` must pass `tty_only=False`. The default is `True`, which silently drops every line when stderr isn't a TTY (Claude Code, Codex, CI, captured output) — turning source observability into invisible failure. Enforced by `tests/test_source_log_visibility.py`.
