@@ -101,7 +101,8 @@ def _isolated_config(tmp_path_factory, monkeypatch):
 def _no_arctic_network():
     """Default Arctic transport collaborators to no-ops outside adapter tests."""
     with mock.patch("lib.reddit_arctic.fetch_scores", return_value={}), \
-         mock.patch("lib.reddit_arctic.fetch_listings", return_value=[]):
+         mock.patch("lib.reddit_arctic.fetch_listings", return_value=[]), \
+         mock.patch("lib.reddit_arctic.fetch_post_comments", return_value=[]):
         yield
 
 
@@ -118,6 +119,18 @@ def _no_ambient_grok_cli():
     # _is_available_uncached then both resolve absent on their own, leaving the
     # module's real control flow intact for tests that exercise it.
     with mock.patch("lib.grok_x.binary_path", return_value=None):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _grok_audit_passes():
+    """Tests that fake the grok subprocess fake a build, not a binary on disk,
+    so the per-build tool-boundary audit cannot run against it. Default the
+    verdict to pass; tests/test_grok_audit.py and the boundary tests exercise
+    the real audit and verdict cache themselves."""
+    from lib import grok_audit
+
+    with mock.patch("lib.grok_audit.verdict_for", return_value=grok_audit.Verdict(grok_audit.PASS)):
         yield
 
 
